@@ -90,4 +90,32 @@ $env:JASNA_LTX_ADAPTIVE_WINDOWS = '1'
 $env:JASNA_LTX_MIXED_ENCODER_TAIL = '1'
 ```
 
-Regression suite after mixed encoder integration: 351 passed.
+Regression suite after mixed encoder integration and metadata/profile updates: 366 passed.
+
+
+## Long-video validation
+
+An additional local test (6959 output frames, 25 tracks, 87 windows at 512,
+174 window-steps) has substantially less padding than the short public clip:
+9679 adaptive model frames versus 10527 fixed model frames. The input and
+output media are not distributed.
+
+| Run | Scan | Encode | Denoise | Compose | Total | Output FPS | Resident | Whole-card peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Adaptive, original VAE | 80.1 | 604.5 | 747.2 | 328.8 | 1760.6 | 3.95 | 6/48 | 7615 |
+| Mixed encoder + compiled decoder, cold shapes | 83.4 | 372.5 | 717.7 | 437.1 | 1610.8 | 4.32 | 7/48 | 7463 |
+| Mixed encoder + compiled decoder, cached | 79.8 | 258.1 | 726.5 | 268.8 | 1333.3 | 5.22 | 8/48 | 7513 |
+
+All three runs completed. Relative to the earlier adaptive run, the final
+cached combined configuration reduced overall time by 24.3% (1.32x
+throughput), encoding time by 57.3%, and composition time by 18.2%.
+Some of these gains reflect compilation cache state, free VRAM and
+resident-block count rather than a controlled isolated change. Long-video
+quality equivalence has not been established. Denoising is now 54.5% of
+total time; further major speedups need reduced transformer compute or
+streamed weight traffic. No further GPU runs were started.
+
+Future experiments: evaluate single-step denoising quality and compatibility
+with the existing distilled checkpoint; investigate INT4 weight storage and
+Turing-compatible kernels with conversion quality and streaming overhead
+measured separately. Neither is implemented.
