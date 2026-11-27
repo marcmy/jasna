@@ -31,3 +31,63 @@ $env:JASNA_LTX_COMPILE_CONV_DECODER = '1' # Convolutional decoder only, requires
 These are experimental switches, not a recommended universal configuration. All remain off by default (reserve defaults to 3072 MiB). The 16-warp wide quantizer is selected only on SM 7.5. Compiled decoder implementation subsequently adjusted to use an unbound function to avoid retaining the decoder through a reference cycle; benchmark timings above precede that cleanup.
 
 Native Windows extension compilation includes /Zc:preprocessor for CUDA 13.5. Local weights, videos, logs and temporary scripts are excluded from source control.
+
+
+## Adaptive temporal windows and mixed-precision VAE tail
+
+The public 300-frame clip has 14 single-window tracks with 256 real track frames
+and 1694 padded model frames. Adaptive windows (minimum 33, lengths 1+8k)
+reduce model frames to 486; 13 windows use 33 frames and one uses 57.
+Multi-window tracks keep their original 121-frame context. The flag is limited
+to local whole-video flat restoration. The output differs from the original
+full-context model; this is a quality/performance tradeoff.
+
+| Run | Scan | Encode | Denoise | Compose | Total | Resident |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Integrated adaptive, cold | 3.4 | 159.6 | 50.4 | 18.0 | 231.4 | |
+| Integrated adaptive, warm | 3.1 | 21.5 | 55.8 | 20.7 | 101.2 | 3/48 |
+| Mixed encoder, cold | 3.1 | 131.4 | 49.8 | 17.3 | 201.5 | 6/48 |
+| Mixed encoder, warm | 3.1 | 20.1 | 48.2 | 17.4 | 88.8 | 7/48 |
+| Mixed encoder + compiled decoder, cold decoder | 3.2 | 20.4 | 49.3 | 153.0 | 226.0 | 7/48 |
+| Mixed encoder + compiled decoder, warm | 3.2 | 20.1 | 52.5 | 18.0 | 93.9 | 6/48 |
+
+Mixed tail keeps residuals, normalization and statistics in FP32; scaled FP16
+convolutions use a conservative weight L1 bound, a normalized input bound or
+dynamic input magnitude, and power-of-two divisors. Only the local conv VAE
+with its original encoder on SM 7.5 opts in. An explicit module replacement
+and distinct compiled graph avoid misleading results from monkeypatching a
+previously compiled graph. Non-finite output raises an error.
+
+Standalone public clip results (median of three cached calls):
+
+| Window | Existing compiled | Mixed compiled | Peak VRAM old/new | Latent PSNR vs compiled |
+| --- | ---: | ---: | --- | ---: |
+| 121 frames | 4.0912 s | 2.3985 s | 3.421 / 3.196 GiB | 79.52 dB |
+| Independent 33 frames | 0.9912 s | 0.6408 s | 1.700 / 1.475 GiB | 79.28 dB |
+
+Cold and warm integrated mixed encoder outputs are pixel-identical after
+decoding all 300 frames. The mixed encoder output vs original adaptive output
+has 42.02 dB PSNR (worst frame 40.35 dB) after lossy output encoding.
+This is not a perceptual equivalence guarantee. Warm decode rates with
+compilation enabled: 1.02 -> 0.77 s/window; overall short-clip time did not improve.
+All flags remain opt-in.
+
+Additional experiments not integrated:
+
+- Fused SM75 CUTLASS INT8 GEMM + epilogue: exact in 35 shape/tile combinations;
+  original 128x128 / 64x64 tile generally best, modest gains for wide matrices
+  and a regression with fused GELU. Avoid another dependency for now.
+- Combined QKV GEMM: exact but roughly 1% faster at 2560-8192 rows with
+  80-256 MiB greater transient peak; contiguous output copies made it slower.
+- Per-layer temporal convolution chunking: exact against eager inference;
+  no encoder speed benefit. Decoder chunk16 cut peak 3.618 -> 3.270 GiB
+  but increased time 3.796 -> 3.976 s.
+
+Additional PowerShell switches:
+
+```powershell
+$env:JASNA_LTX_ADAPTIVE_WINDOWS = '1'
+$env:JASNA_LTX_MIXED_ENCODER_TAIL = '1'
+```
+
+Regression suite after mixed encoder integration: 351 passed.

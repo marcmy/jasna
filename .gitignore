@@ -92,6 +92,7 @@ jasna/ltx/native/prebuilt/
 /test-short.mp4
 /test-restored*.mp4
 /benchmark-*.mp4
+/benchmark-*.mkv
 
 # Temporary LTX working directories
 .ltx-*/

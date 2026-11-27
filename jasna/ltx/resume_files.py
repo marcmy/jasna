@@ -16,7 +16,7 @@ from jasna.job_resume import write_json
 from jasna.ltx.camera import CropFrame
 from jasna.ltx.plan import LARGE_CANVAS, TrackPlan
 from jasna.ltx.spans import LtxSpan
-from jasna.ltx.windows import Window
+from jasna.ltx.windows import WINDOW_FRAMES, Window
 from jasna.os_utils import atomic_write
 
 if TYPE_CHECKING:
@@ -120,6 +120,7 @@ def plans_to_arrays(segments: Sequence[Sequence[TrackPlan]]) -> dict[str, np.nda
         "windows": np.array(
             [(t, w.index, w.track_id, w.start, w.real_frames, w.noise) for t, w in windows], dtype=np.int64
         ).reshape(-1, 6),
+        "model_frames": np.array([w.model_frames for _, w in windows], dtype=np.int64),
         "crops": np.array(
             [(*c.crop_box, *c.resize_hw, *c.pad) for _, w in windows for c in w.crops], dtype=np.int64
         ).reshape(-1, 10),
@@ -135,9 +136,10 @@ def plans_from_arrays(arrays: Mapping[str, np.ndarray]) -> list[list[TrackPlan]]
     presence = iter(arrays["presence"].tolist())
     crops = iter(CropFrame(tuple(c[:4]), tuple(c[4:6]), tuple(c[6:])) for c in arrays["crops"].tolist())
     windows: dict[int, list[Window]] = {}
-    for t, index, track_id, start, real_frames, noise in arrays["windows"].tolist():
+    lengths = arrays.get("model_frames", np.full(len(arrays["windows"]), WINDOW_FRAMES))
+    for (t, index, track_id, start, real_frames, noise), model_frames in zip(arrays["windows"].tolist(), lengths.tolist(), strict=True):
         windows.setdefault(t, []).append(
-            Window(index, track_id, start, real_frames, tuple(itertools.islice(crops, real_frames)), noise)
+            Window(index, track_id, start, real_frames, tuple(itertools.islice(crops, real_frames)), noise, model_frames)
         )
     segments: list[list[TrackPlan]] = [[] for _ in range(int(arrays["segments"]))]
     for t, (s, track_id, start, window_hop, frames) in enumerate(arrays["tracks"].tolist()):

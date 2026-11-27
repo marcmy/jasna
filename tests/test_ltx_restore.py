@@ -1654,3 +1654,37 @@ def test_the_speed_test_mosaics_plan_two_windows_on_each_canvas(frame_h, frame_w
         max_gap=MAX_GAP, min_duration=0,
     )
     assert sorted(w.canvas for plan in plans for w in plan.windows) == [512, 512, 768, 768]
+
+
+@pytest.mark.parametrize("real, expected", [(1,33), (25,33), (33,33), (34,41), (56,57), (120,121), (121,121)])
+def test_adaptive_window_rounding(real, expected):
+    from jasna.ltx.windows import adaptive_window_frames
+    assert adaptive_window_frames(real) == expected
+
+
+def test_adaptive_plan_keeps_multi_window_tracks_at_full_length():
+    from jasna.ltx.restore import adaptive_track_plans
+    crop = CropFrame((0, 0, 8, 8), (8, 8), (0, 0, 0, 0))
+    short = Window(0, 0, 0, 2, (crop,)*2, 0)
+    long = Window(1, 1, 0, 121, (crop,)*121, 1)
+    tail = Window(2, 1, 104, 33, (crop,)*33, 2)
+    plans = [track_plan((short,)), track_plan((long, tail))]
+    adaptive = adaptive_track_plans(plans)
+    assert adaptive[0].windows[0].model_frames == 33
+    assert adaptive[1] is plans[1]
+    assert plans[0].windows[0].model_frames == 121
+
+
+def test_adaptive_buffers_keep_shapes_separate_and_pad_to_actual_length():
+    buffers = encode_pass._WindowBuffers(torch.device("cpu"), 0)
+    short = buffers.take(8, 33)
+    full = buffers.take(8)
+    assert short.shape == (3, 33, 8, 8)
+    assert full.shape == (3, 121, 8, 8)
+    encode_pass._copy_canvas(short, 0, 2, torch.full((3, 8, 8), 7, dtype=torch.uint8))
+    encode_pass._copy_canvas(short, 1, 2, torch.full((3, 8, 8), 19, dtype=torch.uint8))
+    assert torch.all(short[:, :1] == 7) and torch.all(short[:, 1:] == 19)
+    buffers.give_back(8, short)
+    buffers.give_back(8, full)
+    assert buffers.take(8, 33) is short
+    assert buffers.take(8) is full

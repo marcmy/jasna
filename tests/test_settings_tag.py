@@ -169,3 +169,14 @@ def test_basicvsrpp_records_tensorrt_only_where_it_runs(monkeypatch, hip, cuda, 
     )
 
     assert settings["basicvsrpp"]["tensorrt"] is tensorrt
+
+
+def test_ltx_records_requested_experimental_vae_switches(monkeypatch):
+    monkeypatch.setenv("JASNA_LTX_MIXED_ENCODER_TAIL", "1")
+    monkeypatch.setenv("JASNA_LTX_COMPILE_CONV_DECODER", "1")
+    ltx = job_settings(
+        session_config(restoration_model_name="ltx"), models=frozenset({"ltx"}),
+        segments=None, vr=FLAT, ltx_weights=WEIGHTS, ltx_large_canvas=False,
+    )["ltx"]
+    assert ltx["mixed_encoder_tail_requested"] is True
+    assert ltx["compiled_conv_decoder_requested"] is True

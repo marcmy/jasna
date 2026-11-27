@@ -896,3 +896,21 @@ def test_abs_rope_rotates_each_pair_by_its_axis_position(compiling, monkeypatch)
     expected = torch.view_as_real(pairs * torch.polar(torch.ones_like(angles), angles)[:, :, :, None]).reshape(x.shape)
 
     torch.testing.assert_close(T.apply_abs_rope_slab(x, attn, w_pos), expected)
+
+
+@pytest.mark.parametrize("normalized", [False, True])
+def test_scaled_tail_conv_preserves_fp32_output_and_avoids_overflow(normalized):
+    torch.manual_seed(25)
+    conv = video_encoder.CausalConv3d(8, 8).float().eval()
+    with torch.no_grad():
+        conv.conv.weight.fill_(0.5)
+        conv.conv.bias.fill_(0.125)
+        x = torch.rand(1, 8, 5, 4, 4) * (1.0 if normalized else 100000.0)
+        reference = conv(x)
+        mixed = video_encoder.ScaledTailConv3d(conv.conv, normalized=normalized)
+        actual = mixed(x)
+        assert actual.dtype == torch.float32
+        assert mixed.conv.weight.dtype == torch.float16
+        assert actual.isfinite().all()
+        torch.testing.assert_close(actual, reference, rtol=0.002, atol=0.005)
+        torch.testing.assert_close(mixed.add_to(x, x), reference + x, rtol=0.002, atol=0.005)

@@ -2,6 +2,7 @@
 
 import logging
 import math
+import os
 from typing import Any, NamedTuple
 
 import torch
@@ -139,6 +140,49 @@ class CausalConv3d(nn.Module):
         return residual + self(x) if out is None else out
 
 
+def mixed_tail_requested() -> bool:
+    """Opt-in mixed-precision convolutional encoder tail for local Turing inference."""
+    return os.environ.get("JASNA_LTX_MIXED_ENCODER_TAIL") == "1"
+
+
+class ScaledTailConv3d(nn.Module):
+    """FP16 convolution with an FP32 input/output and an overflow-resistant power-of-two scale.
+
+    The normalized inputs follow PixelNorm and SiLU, so their magnitude is bounded by
+    sqrt(in_channels). Other inputs use their actual maximum magnitude. The absolute
+    convolution weight sums bound the convolution output, with generous headroom
+    below fp16's maximum. Residual addition and normalization stay in FP32.
+    """
+
+    def __init__(self, conv: nn.Conv3d, *, normalized: bool) -> None:
+        super().__init__()
+        self.conv = conv.half()
+        self.normalized = normalized
+        weight = self.conv.weight.detach().float()
+        self.l1 = float(weight.abs().sum((1, 2, 3, 4)).amax())
+        self.bias_max = float(self.conv.bias.detach().float().abs().amax()) if self.conv.bias is not None else 0.0
+        self.fixed = 2.0 ** max(0, math.ceil(math.log2(max(
+            1.0, (math.sqrt(conv.in_channels) * self.l1 + self.bias_max) / 16384.0
+        ))))
+        self.register_buffer("fp32_bias", self.conv.bias.detach().float().clone()
+                             if self.conv.bias is not None else None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.normalized:
+            divisor = self.fixed
+        else:
+            bound = (x.abs().amax() * self.l1 + self.bias_max) / 16384.0
+            divisor = torch.exp2(torch.ceil(torch.log2(torch.clamp(bound, min=1.0))))
+        scaled = (x / divisor).to(dtype=torch.float16, memory_format=torch.channels_last_3d)
+        first = scaled[:, :, :1]
+        padded = torch.cat((first, first, scaled), dim=2)
+        bias = None if self.fp32_bias is None else (self.fp32_bias / divisor).half()
+        return F.conv3d(padded, self.conv.weight, bias, padding=(0, 1, 1)).float() * divisor
+
+    def add_to(self, residual: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        return residual + self(x)
+
+
 class ResnetBlock3D(nn.Module):
     """PixelNorm -> SiLU -> conv, twice, plus identity skip."""
 
@@ -248,6 +292,7 @@ class VideoEncoder(nn.Module):
         # One extra channel: the checkpoint's (unused) constant log-variance.
         self.conv_out = CausalConv3d(feature_channels, out_channels + 1)
         self.releases_cache_between_stages = False
+        self.mixed_precision_tail = False
 
     def to_fp16_head(self, down_blocks: int) -> "VideoEncoder":
         """fp16 for ``conv_in`` and the first ``down_blocks`` down blocks; the rest keeps its dtype."""
@@ -287,6 +332,27 @@ class VideoEncoder(nn.Module):
         """fp16 for the high-resolution layers (nearly all the FLOPs), fp32 for the tail."""
         return self.float().to_fp16_head(FP16_DOWN_BLOCKS)
 
+    def enable_mixed_precision_tail(self) -> None:
+        """Replace only the existing FP32 tail's convolutions, not its residual streams."""
+        if self.mixed_precision_tail:
+            return
+        for block in self.down_blocks[FP16_DOWN_BLOCKS:]:
+            if isinstance(block, SpaceToDepthDownsample):
+                if block.conv.conv.weight.dtype != torch.float32:
+                    raise ValueError("mixed encoder tail requires FP32 tail weights")
+                block.conv = ScaledTailConv3d(block.conv.conv, normalized=False)
+            elif isinstance(block, UNetMidBlock3D):
+                for resnet in block.res_blocks:
+                    for name in ("conv1", "conv2"):
+                        conv = getattr(resnet, name).conv
+                        if conv.weight.dtype != torch.float32:
+                            raise ValueError("mixed encoder tail requires FP32 tail weights")
+                        setattr(resnet, name, ScaledTailConv3d(conv, normalized=True))
+            else:
+                raise ValueError("unsupported mixed encoder tail block")
+        self.conv_out = ScaledTailConv3d(self.conv_out.conv, normalized=True)
+        self.mixed_precision_tail = True
+
     def forward(self, sample: torch.Tensor) -> torch.Tensor:
         temporal_factor = self.video_scale_factors.time
         frames_count = sample.shape[2]
@@ -300,6 +366,12 @@ class VideoEncoder(nn.Module):
             )
             sample = sample[:, :, :-frames_to_crop, ...]
 
+        if self.mixed_precision_tail:
+            encode = _encode_mixed_cropped if sample.is_cuda else encode_mixed_cropped
+            latent = encode(self, sample.to(_weight_dtype(self.conv_in)))
+            if not torch.isfinite(latent).all().item():
+                raise RuntimeError("mixed precision VAE encoder produced non-finite latents")
+            return latent
         encode = _encode_cropped if sample.is_cuda else encode_cropped
         return encode(self, sample.to(_weight_dtype(self.conv_in))).to(torch.bfloat16)
 
@@ -347,7 +419,28 @@ def encode_cropped(encoder: VideoEncoder, sample: torch.Tensor) -> torch.Tensor:
     return encoder.per_channel_statistics.normalize(means)
 
 
+def encode_mixed_cropped(encoder: VideoEncoder, sample: torch.Tensor) -> torch.Tensor:
+    """Keep the head unchanged and the entire tail's residual streams in FP32."""
+    sample = patchify(sample, patch_size_hw=encoder.patch_size)
+    sample = encoder.conv_in(sample)
+    for block in encoder.down_blocks[:FP16_DOWN_BLOCKS]:
+        sample = block(_layer_input(sample, block))
+    sample = sample.float()
+    for block in encoder.down_blocks[FP16_DOWN_BLOCKS:]:
+        sample = block(sample)
+    sample = encoder.conv_out(encoder.conv_act(encoder.conv_norm_out(sample)))
+    return encoder.per_channel_statistics.normalize(sample[:, :-1]).to(torch.bfloat16)
+
+
+_encode_mixed_cropped = encode_mixed_cropped
 _encode_cropped = encode_cropped
+
+
+def compile_mixed_video_encoder(device: torch.device) -> None:
+    global _encode_mixed_cropped
+    if _encode_mixed_cropped is encode_mixed_cropped:
+        _encode_mixed_cropped = compile_static(encode_mixed_cropped, mode=ENCODER_COMPILE_MODE,
+                                              device=device, dtype=torch.float16)
 
 
 def compile_video_encoder(device: torch.device, dtype: torch.dtype) -> None:

@@ -19,6 +19,7 @@ from jasna.ltx.host_tensors import zero_tensors
 from jasna.ltx.model_files import LtxModelFiles, PlaceholderTensors
 from jasna.ltx.sampler import LtxTransformer, TransformerSource
 from jasna.models.ltx_vae import decode_latent, load_video_decoder, load_video_encoder
+from jasna.models.ltx_vae.video_encoder import mixed_tail_requested
 from jasna.tensor_utils import half_dtype
 
 logger = logging.getLogger(__name__)
@@ -223,7 +224,8 @@ class ModelRuntime:
                     self.request("load_encoder", {}, [])
                     self._encoder = WorkerEncoder(self)
                 else:
-                    self._encoder = load_video_encoder(self.files.vae, self.device, self.files.encoder)
+                    options = {"mixed_tail": True} if mixed_tail_requested() else {}
+                    self._encoder = load_video_encoder(self.files.vae, self.device, self.files.encoder, **options)
         return self._encoder
 
     def unload_encoder(self) -> None:

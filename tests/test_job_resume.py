@@ -607,3 +607,44 @@ def test_saved_ltx_work_finds_saved_track_plans_of_the_output(tmp_path):
     ltx.mkdir(parents=True)
     (ltx / "0-1.plans.npz").touch()
     assert job_resume.saved_ltx_work(config, output)
+
+
+def test_adaptive_window_length_survives_plan_round_trip():
+    crop = CropFrame((0, 0, 8, 8), (8, 8), (0, 0, 0, 0))
+    polygon = np.array([[0, 0], [2, 0], [2, 2]], dtype=np.int32)
+    window = Window(0, 0, 0, 2, (crop, crop), 0, 33)
+    plan = TrackPlan(0, 0, ((polygon,), (polygon,)), (1., 1.), (window,), 104)
+    arrays = plans_to_arrays([[plan]])
+    assert plans_from_arrays(arrays)[0][0].windows[0].model_frames == 33
+    del arrays["model_frames"]
+    assert plans_from_arrays(arrays)[0][0].windows[0].model_frames == 121
+
+
+def test_adaptive_windows_invalidate_resume_fingerprint(job, monkeypatch):
+    config, source, output, metadata = job
+    monkeypatch.delenv("JASNA_LTX_ADAPTIVE_WINDOWS", raising=False)
+    original = job_fingerprints(config, source, output, metadata, None)
+    monkeypatch.setenv("JASNA_LTX_ADAPTIVE_WINDOWS", "1")
+    adaptive = job_fingerprints(config, source, output, metadata, None)
+    assert original[0] != adaptive[0]
+    assert original[1] != adaptive[1]
+    monkeypatch.delenv("JASNA_LTX_ADAPTIVE_WINDOWS")
+    assert original == job_fingerprints(config, source, output, metadata, None)
+
+
+def test_mixed_encoder_tail_invalidates_resume_fingerprint(job, monkeypatch):
+    config, source, output, metadata = job
+    monkeypatch.delenv("JASNA_LTX_MIXED_ENCODER_TAIL", raising=False)
+    original = job_fingerprints(config, source, output, metadata, None)
+    monkeypatch.setenv("JASNA_LTX_MIXED_ENCODER_TAIL", "1")
+    assert original != job_fingerprints(config, source, output, metadata, None)
+
+
+def test_compiled_conv_decoder_changes_job_not_latent_fingerprint(job, monkeypatch):
+    config, source, output, metadata = job
+    monkeypatch.delenv("JASNA_LTX_COMPILE_CONV_DECODER", raising=False)
+    original = job_fingerprints(config, source, output, metadata, None)
+    monkeypatch.setenv("JASNA_LTX_COMPILE_CONV_DECODER", "1")
+    compiled = job_fingerprints(config, source, output, metadata, None)
+    assert original[0] != compiled[0]
+    assert original[1] == compiled[1]

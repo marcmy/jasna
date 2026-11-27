@@ -25,6 +25,7 @@ from jasna.models.ltx_vae.video_encoder import (
     AMD_KITCHEN_DOWN_BLOCKS,
     VideoEncoder,
     compile_video_encoder,
+    compile_mixed_video_encoder,
     encoder_head,
 )
 from jasna.tensor_utils import compile_static, half_dtype
@@ -193,7 +194,8 @@ def _with_res_layers(blocks: list, state: Iterable[str]) -> list:
             for index, (kind, params) in enumerate(blocks)]
 
 
-def load_video_encoder(vae_path: Path, device: torch.device, encoder_path: Path | None = None) -> VideoEncoder:
+def load_video_encoder(vae_path: Path, device: torch.device, encoder_path: Path | None = None,
+                       *, mixed_tail: bool = False) -> VideoEncoder:
     """Eval ``VideoEncoder`` in ``half_dtype(device)`` (before SM 8.0 fp16 with an fp32 tail; on
     AMD and the NVIDIA GPUs in ``ENCODER_HEADS`` a head in fp16 on comfy-kitchen's and
     ``conv_triton``'s conv3d); call it on
@@ -202,7 +204,8 @@ def load_video_encoder(vae_path: Path, device: torch.device, encoder_path: Path 
     checkpoint, encoder = {}, None
     try:
         with open_tensors(vae_path) as reader:
-            kwargs = encoder_kwargs(read_vae_config(reader))
+            config = read_vae_config(reader)
+            kwargs = encoder_kwargs(config)
             if encoder_path is None:
                 checkpoint = _read_tensors(reader, ("encoder.", "per_channel_statistics."))
         if encoder_path is not None:
@@ -231,7 +234,14 @@ def load_video_encoder(vae_path: Path, device: torch.device, encoder_path: Path 
         if eager_amd:
             encoder.release_cache_between_stages()
         zero_tensors(bf16_contiguous_weights, encoder)
-        compile_video_encoder(device, dtype)
+        if (mixed_tail and device.type == "cuda" and dtype == torch.float16
+                and config.get("_class_name") == _CONV_VAE_CLASS_NAME
+                and encoder_path is None and gpu_architecture(device) == (7, 5)):
+            encoder.enable_mixed_precision_tail()
+            compile_mixed_video_encoder(device)
+            logger.info("LTX VAE encoder: experimental scaled FP16 tail (FP32 residuals)")
+        else:
+            compile_video_encoder(device, dtype)
         return encoder
     finally:
         zero_tensors(checkpoint.values(), encoder)
@@ -253,6 +263,10 @@ def conv_decoder_kwargs(config: dict) -> dict:
     }
 
 
+def compiled_conv_decoder_requested() -> bool:
+    return os.environ.get("JASNA_LTX_COMPILE_CONV_DECODER") == "1"
+
+
 def _load_conv_video_decoder(config: dict, checkpoint: dict[str, torch.Tensor], device: torch.device) -> ConvVideoDecoder:
     """Eval the convolutional VAE in half_dtype, without a fine-tuned overlay.
 
@@ -263,7 +277,7 @@ def _load_conv_video_decoder(config: dict, checkpoint: dict[str, torch.Tensor], 
     dtype = half_dtype(device)
     decoder = _build(lambda: ConvVideoDecoder(**kwargs), state, device, dtype)
     decoder.to(memory_format=torch.channels_last_3d)
-    if device.type == "cuda" and os.environ.get("JASNA_LTX_COMPILE_CONV_DECODER") == "1":
+    if device.type == "cuda" and compiled_conv_decoder_requested():
         # Compile the unbound method so the decoder does not retain itself through
         # a bound-method closure after the compose pass unloads the model.
         eager = ConvVideoDecoder.forward

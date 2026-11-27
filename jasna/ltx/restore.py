@@ -62,7 +62,10 @@ from jasna.ltx.spans import (
 from jasna.ltx.super_res import LtxSuperRes
 from jasna.ltx.tracks import Region
 from jasna.ltx.vram_budget import DecodeBudget, free_vram_budget
+from jasna.ltx.windows import ADAPTIVE_MIN_FRAMES, adaptive_window_frames
 from jasna.mosaic.detections import Detections
+from jasna.models.ltx_vae.video_encoder import mixed_tail_requested
+from jasna.models.ltx_vae.loader import compiled_conv_decoder_requested
 from jasna.os_utils import atomic_write, scratch_folder
 from jasna.tracking.scene_detector import SceneCutDetector
 from jasna.vr180 import StereoLayout
@@ -162,6 +165,7 @@ class LtxRender:
     vr_projector: RegionProjector | None
     frame_numbers: FrameNumbers
     on_scan_complete: Callable[[], None] | None = None
+    adaptive_windows: bool = False
 
 
 @dataclass(frozen=True)
@@ -256,6 +260,15 @@ def _settle(worker_ready: Future | None) -> None:
         logger.debug("LTX worker started ahead of a pass that did not need it failed: %r", error)
 
 
+def adaptive_track_plans(plans: list[TrackPlan]) -> list[TrackPlan]:
+    # Preserve multi-window tracks' full length and overlap fusion semantics.
+    return [
+        replace(plan, windows=(replace(plan.windows[0], model_frames=adaptive_window_frames(plan.windows[0].real_frames)),))
+        if len(plan.windows) == 1 else plan
+        for plan in plans
+    ]
+
+
 def _scan_spans(
     spans: Sequence[LtxSpan], render: LtxRender, directory: Path, *, progress: Progress, cancel: threading.Event,
     worker_ready: Future | None,
@@ -291,6 +304,8 @@ def _scan_spans(
                     large_canvas=render.large_canvas, window_hop=render.window_hop, bar=bar, cancel=cancel,
                     max_gap=render.max_gap, min_duration=render.min_duration, frame_numbers=render.frame_numbers,
                 )
+                if render.adaptive_windows:
+                    span_plans = [adaptive_track_plans(segment) for segment in span_plans]
                 check_cancel(cancel)
                 with atomic_write(plan_path(span, directory), "wb") as stream:
                     np.savez(stream, frames=np.array(count), **plans_to_arrays(span_plans))
@@ -300,6 +315,8 @@ def _scan_spans(
         for span, span_plans in zip(spans, plans)
     ]
     planned = [w for p in prepared for track_plans in p.plans for plan in track_plans for w in plan.windows]
+    if render.adaptive_windows:
+        logger.info("LTX adaptive model frames: %s", dict(sorted(Counter(w.model_frames for w in planned).items())))
     crop_pixels = sum(
         (c.crop_box[2] - c.crop_box[0]) * (c.crop_box[3] - c.crop_box[1]) for w in planned for c in w.crops
     )
@@ -353,6 +370,7 @@ def denoise_spans(
                         next_plan = pending[index + 1]
                         if (len(next_plan.windows) == 1
                                 and next_plan.windows[0].canvas == plan.windows[0].canvas
+                                and next_plan.windows[0].model_frames == plan.windows[0].model_frames
                                 and next_plan.window_hop == plan.window_hop):
                             group.append(next_plan)
                     advance = bar.track(plan.windows[0].canvas, len(transformer.conditions))
@@ -449,7 +467,12 @@ def _first_frames(frames: FrameSource, count: int) -> FrameSource:
 
 
 def _profile_key(render: LtxRender) -> str:
-    return speed.profile_key(torch.cuda.get_device_name(render.device), render.files.transformer_name, render.budget_name)
+    key = speed.profile_key(torch.cuda.get_device_name(render.device), render.files.transformer_name, render.budget_name)
+    if mixed_tail_requested():
+        key += " | mixed encoder tail"
+    if compiled_conv_decoder_requested():
+        key += " | compiled conv decoder"
+    return key + f" | adaptive min{ADAPTIVE_MIN_FRAMES}" if render.adaptive_windows else key
 
 
 def restore_spans(
@@ -462,7 +485,8 @@ def restore_spans(
     Without a speed profile for this GPU and model, a speed test runs first in a temporary
     directory under ``work_dir``: the first frames of the first span with two made-up mosaics,
     restored and thrown away, so the run's time left is known once its scan has planned it."""
-    if not speed.load_rates(render.speed_profile, _profile_key(render)):
+    # Adaptive jobs learn from their real windows rather than the fixed-length synthetic test.
+    if not render.adaptive_windows and not speed.load_rates(render.speed_profile, _profile_key(render)):
         logger.info("LTX speed test: no speed profile for this GPU and model yet")
         speed_test = LtxSpan(
             _first_frames(spans[0].frames, SPEED_TEST_FRAMES),
@@ -550,6 +574,7 @@ def restore_video(
     frame_numbers: FrameNumbers,
     runtime: ModelRuntime,
     on_scan_complete: Callable[[], None] | None = None,
+    adaptive_windows: bool = False,
 ) -> None:
     """Restore every mosaic of the video ``frames`` yields as one segment. ``large_canvas``
     is ``whole_video_large_canvas``'s decision; the decode tiles follow the free VRAM."""
@@ -575,6 +600,7 @@ def restore_video(
             vr_projector=vr_projector,
             frame_numbers=frame_numbers,
             on_scan_complete=on_scan_complete,
+            adaptive_windows=adaptive_windows,
         ),
         work_dir=work_dir,
         progress=progress,

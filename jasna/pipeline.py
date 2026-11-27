@@ -488,6 +488,7 @@ class Pipeline:
         from jasna.ltx.spans import FrameNumbers
         from jasna.ltx.vram_budget import whole_video_large_canvas
         from jasna.ltx.speed import profile_path
+        from jasna.ltx.windows import adaptive_windows_requested, ADAPTIVE_MIN_FRAMES
 
         frame_rate = self._resolve_frame_rate(metadata)
         resume_dir = self.resume.directory / "ltx"
@@ -496,6 +497,13 @@ class Pipeline:
             encoder_bytes=self._encoder_vram_bytes(metadata),
         )
         settings = self._job_settings(frozenset({"ltx"}), ltx_large_canvas=large_canvas)
+        adaptive_windows = (
+            adaptive_windows_requested() and not self._ltx_runtime.protected
+            and not self.config.ltx_trial and self.stereo is None and self.vr_projector is None
+        )
+        if adaptive_windows:
+            settings["ltx"]["adaptive_window_min_frames"] = ADAPTIVE_MIN_FRAMES
+            log.info("LTX adaptive temporal windows enabled (minimum %d frames)", ADAPTIVE_MIN_FRAMES)
         encoder = self._video_encoder(metadata, frame_rate, settings)
         try:
             restore_video(
@@ -529,6 +537,7 @@ class Pipeline:
                 frame_numbers=FrameNumbers.of_video(metadata),
                 runtime=self._ltx_runtime,
                 on_scan_complete=self._release_ltx_detector,
+                adaptive_windows=adaptive_windows,
             )
         except Cancelled:
             log.info("LTX restoration cancelled")

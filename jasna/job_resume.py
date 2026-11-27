@@ -114,6 +114,9 @@ def job_inputs(config: SessionConfig, source: Path, output: Path, metadata, spli
     (codec, quality, LUT, sharpening, BasicVSR++ settings) keeps them."""
     from jasna.ltx.model_files import bundle_paths
     from jasna.ltx.tracks import track_max_gap
+    from jasna.ltx.windows import adaptive_windows_requested, ADAPTIVE_MIN_FRAMES
+    from jasna.models.ltx_vae.video_encoder import mixed_tail_requested
+    from jasna.models.ltx_vae.loader import compiled_conv_decoder_requested
 
     stat = source.stat()
     settings = asdict(config)
@@ -148,6 +151,12 @@ def job_inputs(config: SessionConfig, source: Path, output: Path, metadata, spli
         "segments": [asdict(segment) for segment in ranges],
         "models": latent_models,
     }
+    if splice_plan is None and "ltx" in models and not config.ltx_trial and adaptive_windows_requested():
+        latents["adaptive_window_min_frames"] = ADAPTIVE_MIN_FRAMES
+    if "ltx" in models and mixed_tail_requested():
+        latents["mixed_encoder_tail"] = True
+    if "ltx" in models and compiled_conv_decoder_requested():
+        settings["compiled_conv_decoder_requested"] = True
     inputs = {
         "latents": latents,
         "output": output.name,

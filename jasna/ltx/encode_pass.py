@@ -52,13 +52,13 @@ class _WindowBuffers:
     def __init__(self, device: torch.device, gpu_bytes: int) -> None:
         self._device = device
         self._gpu_bytes_left = gpu_bytes
-        self._free: dict[int, list[torch.Tensor]] = {}
+        self._free: dict[tuple[int, int], list[torch.Tensor]] = {}
 
-    def take(self, canvas: int) -> torch.Tensor:
-        free = self._free.setdefault(canvas, [])
+    def take(self, canvas: int, frames: int = WINDOW_FRAMES) -> torch.Tensor:
+        free = self._free.setdefault((canvas, frames), [])
         if free:
             return free.pop()
-        shape = (3, WINDOW_FRAMES, canvas, canvas)
+        shape = (3, frames, canvas, canvas)
         size = math.prod(shape)
         if size <= self._gpu_bytes_left:
             self._gpu_bytes_left -= size
@@ -66,13 +66,13 @@ class _WindowBuffers:
         return torch.empty(shape, dtype=torch.uint8)
 
     def give_back(self, canvas: int, pixels: torch.Tensor) -> None:
-        self._free[canvas].append(pixels)
+        self._free[(canvas, pixels.shape[1])].append(pixels)
 
 
 def _copy_canvas(window_pixels: torch.Tensor, position: int, real_frames: int, canvas: torch.Tensor) -> None:
     """``canvas`` into frame ``position``; the last real frame also fills the padding frames."""
     last = position == real_frames - 1
-    window_pixels[:, position : WINDOW_FRAMES if last else position + 1].copy_(canvas.unsqueeze(1))
+    window_pixels[:, position : window_pixels.shape[1] if last else position + 1].copy_(canvas.unsqueeze(1))
 
 
 class _WindowEncodes:
@@ -175,7 +175,7 @@ class _SegmentEncoder:
 
     def frame(self, frame: torch.Tensor) -> None:
         while self._upcoming is not None and self._upcoming.start == self._frame_idx:
-            self._active[self._upcoming.index] = (self._upcoming, self._buffers.take(self._upcoming.canvas))
+            self._active[self._upcoming.index] = (self._upcoming, self._buffers.take(self._upcoming.canvas, self._upcoming.model_frames))
             self._upcoming = next(self._pending, None)
         for index, (window, window_pixels) in list(self._active.items()):
             position = self._frame_idx - window.start

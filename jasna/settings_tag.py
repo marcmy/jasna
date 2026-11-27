@@ -136,6 +136,14 @@ def job_settings(
             ltx["super_res"] = _rtx_settings(config)
         if config.ltx_trial:
             ltx["trial"] = True
+        # Requested experimental switches, not a claim that the model/device supports them.
+        from jasna.models.ltx_vae.video_encoder import mixed_tail_requested
+        from jasna.models.ltx_vae.loader import compiled_conv_decoder_requested
+
+        if mixed_tail_requested():
+            ltx["mixed_encoder_tail_requested"] = True
+        if compiled_conv_decoder_requested():
+            ltx["compiled_conv_decoder_requested"] = True
         settings["ltx"] = ltx
     if config.restoration_model_name == "ltx" and config.ltx_auto_split_percent is not None:
         settings["auto_split_percent"] = config.ltx_auto_split_percent

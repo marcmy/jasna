@@ -3,6 +3,7 @@ the compose crossfade and the latent frames fused while denoising."""
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -18,6 +19,17 @@ WINDOW_HOP = 88
 
 
 TEMPORAL_SCALE = 8
+ADAPTIVE_MIN_FRAMES = 33
+
+
+def adaptive_windows_requested() -> bool:
+    return os.environ.get("JASNA_LTX_ADAPTIVE_WINDOWS") == "1"
+
+
+def adaptive_window_frames(real_frames: int) -> int:
+    if not 1 <= real_frames <= WINDOW_FRAMES:
+        raise ValueError("Invalid real window length")
+    return max(ADAPTIVE_MIN_FRAMES, 1 + TEMPORAL_SCALE * ((real_frames - 1 + TEMPORAL_SCALE - 1) // TEMPORAL_SCALE))
 
 
 @dataclass(frozen=True)
@@ -25,9 +37,10 @@ class Window:
     index: int  # global across tracks; also the noise seed offset
     track_id: int
     start: int
-    real_frames: int  # the model always sees WINDOW_FRAMES; the tail is padded
+    real_frames: int  # the remaining model frames are padded
     crops: tuple[CropFrame, ...]  # one per real frame
     noise: int  # noise seed offset: the index, or the left window's for a right-eye twin
+    model_frames: int = WINDOW_FRAMES
 
     @property
     def stop(self) -> int:
