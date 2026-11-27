@@ -81,3 +81,20 @@ assets/benchmark/
 
 # release-built native LTX block (jasna.ltx.native.prebuild)
 jasna/ltx/native/prebuilt/
+
+# Downloaded third-party model weights
+/kukkiri-weights/
+*.safetensors
+
+# Local testing and benchmarking
+*.log
+*.bak
+/test-short.mp4
+/test-restored*.mp4
+/benchmark-*.mp4
+
+# Temporary LTX working directories
+.ltx-*/
+
+# Jasna restoration resume data
+*.jasna-resume/
