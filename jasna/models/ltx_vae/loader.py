@@ -257,7 +257,7 @@ def _load_conv_video_decoder(config: dict, checkpoint: dict[str, torch.Tensor], 
     fp16's range). It runs eagerly and takes no fine-tuned overlay."""
     kwargs = conv_decoder_kwargs(config)
     state = {key.removeprefix("decoder."): value for key, value in checkpoint.items()}
-    dtype = torch.bfloat16 if half_dtype(device) == torch.bfloat16 else torch.float32
+    dtype = half_dtype(device)
     decoder = _build(lambda: ConvVideoDecoder(**kwargs), state, device, dtype)
     return decoder.to(memory_format=torch.channels_last_3d)
 
@@ -331,7 +331,10 @@ def decode_latent(
     if isinstance(decoder, ConvVideoDecoder):
         weight = decoder.conv_in.conv.weight
         sample = latent.to(dtype=weight.dtype, memory_format=torch.channels_last_3d)
-        return decoder(sample).to(latent.dtype)
+        video = decoder(sample)
+        if not torch.isfinite(video).all().item():
+            raise RuntimeError('Conv VAE produced non-finite values')
+        return video.to(latent.dtype)
     _b, _c, frames, height, width = latent.shape
     scale = decoder.video_downscale_factors
     pixels = (frames - 1) * scale.time + 1, height * scale.height, width * scale.width

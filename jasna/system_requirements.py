@@ -115,7 +115,7 @@ class FfprobeStatus:
 
     @property
     def ok(self) -> bool:
-        return self.major == FFPROBE_MAJOR_VERSION
+        return self.major is not None and self.major >= FFPROBE_MAJOR_VERSION
 
 
 def ffprobe_status() -> FfprobeStatus:
@@ -154,7 +154,7 @@ def check_required_executables() -> None:
         sys.exit(1)
     if not status.ok:
         detected = "could not detect major version" if status.major is None else f"detected major={status.major}"
-        print(f"Error: ffprobe major version must be exactly 8 (or detectable as 8): ffprobe ({detected})")
+        print(f"Error: ffprobe major version must be 8 or newer: ffprobe ({detected})")
         print(FFMPEG_DOWNLOAD_LINKS)
         sys.exit(1)
 
