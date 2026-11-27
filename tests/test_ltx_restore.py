@@ -990,6 +990,33 @@ def test_restore_spans_shows_each_pass_before_its_model_loads(fakes, monkeypatch
     assert shown_at_load == [("encoder", "encode"), ("transformer", "denoise"), ("decoder", "compose")]
 
 
+@pytest.mark.parametrize("speed_test", [False, True])
+def test_scan_complete_releases_detector_only_after_real_scan(fakes, monkeypatch, tmp_path, speed_test):
+    render = _render(tmp_path)
+    if speed_test:
+        render.speed_profile.unlink()
+    events = []
+    load_encoder = inference.load_video_encoder
+
+    def encoder(*args):
+        events.append("encode")
+        return load_encoder(*args)
+
+    def after_scan():
+        assert render.detector.batches
+        events.append("release")
+
+    monkeypatch.setattr(inference, "load_video_encoder", encoder)
+    video = _video(12, range(2, 10))
+    restore.restore_spans(
+        [ltx_spans.LtxSpan(_source(video), (ltx_spans.LtxSegment(*ltx_spans.WHOLE_VIDEO_PTS, 1),), _Writer)],
+        replace(render, on_scan_complete=after_scan),
+        work_dir=tmp_path, resume_dir=_new_dir(tmp_path), progress=_progress(12),
+        cancel=threading.Event(), runtime=_runtime(),
+    )
+    assert events == (["encode", "release", "encode"] if speed_test else ["release", "encode"])
+
+
 def test_restore_spans_frees_the_decoder_and_its_cached_memory_after_compose(fakes, monkeypatch, tmp_path):
     class Decoder:
         pass

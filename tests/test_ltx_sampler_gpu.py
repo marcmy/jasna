@@ -81,3 +81,26 @@ def test_denoise_windows_keeps_only_the_group_being_denoised_on_the_gpu():
         _denoise_windows(_windows(count), 2, peaks[count], WINDOW_HOP)
     window_bytes = 2 * 128 * LATENT_FRAMES * 4 * 4 * 2
     assert max(peaks[64]) - max(peaks[4]) < window_bytes
+
+
+@pytest.mark.parametrize("group", [1, 2])
+def test_independent_windows_match_separate_tracks_bit_for_bit(group):
+    references = _windows(2)
+    seeds = [21, 96]
+    calls = []
+    def run(refs, noise_seeds, group_size, independent):
+        def denoise(inputs, step):
+            calls.append(len(inputs))
+            return _fake_denoise([])(inputs, step)
+        return denoise_windows(
+            refs, noise_seeds, SIGMAS, window_hop=WINDOW_HOP,
+            steps=len(SIGMAS) - 1, group=group_size, denoise=denoise,
+            advance=lambda n: None, device=torch.device("cuda"),
+            independent=independent,
+        )
+    expected = [run([ref], [seed], 1, False)[0] for ref, seed in zip(references, seeds)]
+    calls.clear()
+    actual = run(references, seeds, group, True)
+    assert len(actual) == len(expected)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+    assert calls == [group] * ((len(SIGMAS) - 1) * (2 // group))

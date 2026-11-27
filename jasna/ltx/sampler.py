@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack, closing
 from pathlib import Path
@@ -36,9 +37,22 @@ PINNED_CHUNK_BYTES = 64 << 20
 _ADALN_PREFIXES = ("adaln_single.", "prompt_adaln_single.")
 
 
-def resident_block_count(sizes: list[int], usable_vram: Callable[[int], int]) -> int:
+def activation_reserve_bytes() -> int:
+    """Experimental opt-in reserve tuning; keep the upstream default unless requested."""
+    raw = os.environ.get("JASNA_LTX_ACTIVATION_RESERVE_MIB")
+    if raw is None:
+        return ACTIVATION_RESERVE_BYTES
+    mib = int(raw)
+    if not 2560 <= mib <= 3072:
+        raise ValueError("JASNA_LTX_ACTIVATION_RESERVE_MIB must be between 2560 and 3072")
+    return mib << 20
+
+
+def resident_block_count(
+    sizes: list[int], usable_vram: Callable[[int], int], *, activation_reserve: int = ACTIVATION_RESERVE_BYTES
+) -> int:
     """How many leading blocks stay in VRAM; ``usable_vram(limit)`` checks at most ``limit`` bytes."""
-    reserve = ACTIVATION_RESERVE_BYTES + 2 * max(sizes)
+    reserve = activation_reserve + 2 * max(sizes)
     # Probe only what all-resident needs, so the GUI preview/decoder/encoder keep their VRAM.
     budget = usable_vram(sum(sizes) + reserve) - reserve
     resident, used = 0, 0
@@ -213,6 +227,7 @@ class LtxTransformer:
                 T.enable_int8_attention(device)
             else:
                 self._block_forward, self._prompt_key_value, self.block_backend = _block_functions(device, block_specs)
+            logger.info("LTX block backend: %s", self.block_backend)
         except BaseException as primary:
             try:
                 self.close()
@@ -230,7 +245,9 @@ class LtxTransformer:
             probed.append(allocatable_bytes(self.device, min(free, limit)))
             return probed[-1]
 
-        resident = resident_block_count(sizes, allocatable)
+        reserve = activation_reserve_bytes()
+        resident = resident_block_count(sizes, allocatable, activation_reserve=reserve)
+        logger.info("LTX activation reserve: %d MiB, largest block: %.1f MiB", reserve >> 20, max(sizes) / (1 << 20))
         logger.info("LTX VRAM at load: %d MiB free, %d MiB allocatable, %d/%d blocks fit resident",
                     free >> 20, probed[0] >> 20, resident, len(sizes))
         return resident
@@ -277,6 +294,8 @@ class LtxTransformer:
         seeds: Sequence[int],
         window_hop: int,
         advance: Callable[[int], None],
+        *,
+        independent: bool = False,
     ) -> list[torch.Tensor]:
         """Final latents ``[1, 128, F, H, W]`` (on the CPU) of one track's windows, given each window's
         reference latent (the encoded mosaic crop), noise seed and the frames between window
@@ -284,6 +303,11 @@ class LtxTransformer:
         frames, height, width = references[0].shape[2:]
         tokens_per_frame = height * width
         rope = self._rope(frames, height, width)
+        group = self._group_size(len(references), 2 * frames * tokens_per_frame)
+        if independent:
+            if any(ref.shape != references[0].shape for ref in references):
+                raise ValueError("Independent windows must have identical latent shapes")
+            logger.info("LTX independent tracks: %d windows, group size %d", len(references), group)
 
         def denoise(inputs: list[torch.Tensor], step: int) -> list[torch.Tensor]:
             return self._denoise(inputs, self.conditions[step], rope, tokens_per_frame, self.sigmas[step])
@@ -294,10 +318,11 @@ class LtxTransformer:
             self.sigmas,
             window_hop=window_hop,
             steps=len(self.conditions),
-            group=self._group_size(len(references), 2 * frames * tokens_per_frame),
+            group=group,
             denoise=denoise,
             advance=advance,
             device=self.device,
+            independent=independent,
         )
         # the allocator still holds the chain's peak, so this reads it; once per transformer
         if not self._over_budget_warned:
@@ -363,8 +388,10 @@ class _FusedChain:
     """Windows' latents pushed in order: each is fused on the GPU with the one before it,
     which then goes back to its host window."""
 
-    def __init__(self, host: list[torch.Tensor], tokens: int, tokens_per_frame: int, shared: SharedLatents) -> None:
+    def __init__(self, host: list[torch.Tensor], tokens: int, tokens_per_frame: int, shared: SharedLatents,
+                 *, independent: bool = False) -> None:
         self._host = host
+        self._independent = independent
         self._shared = shared
         self._tokens = tokens
         self._tokens_per_frame = tokens_per_frame
@@ -372,7 +399,8 @@ class _FusedChain:
 
     def push(self, index: int, latent: torch.Tensor, right_weights: Sequence[float]) -> None:
         if self._held is not None:
-            fuse_overlaps([self._held[1], latent], self._tokens_per_frame, self._shared, right_weights)
+            if not self._independent:
+                fuse_overlaps([self._held[1], latent], self._tokens_per_frame, self._shared, right_weights)
             self._store(*self._held)
         self._held = (index, latent)
 
@@ -395,6 +423,7 @@ def denoise_windows(
     denoise: Callable[[list[torch.Tensor], int], list[torch.Tensor]],
     advance: Callable[[int], None],
     device: torch.device,
+    independent: bool = False,
 ) -> list[torch.Tensor]:
     """Final latents of a chain of overlapping windows. Each window waits in pinned host
     memory as ``[1, 2T, C]`` latent-then-reference tokens; only the ``group`` windows being
@@ -407,7 +436,7 @@ def denoise_windows(
     for window, reference in zip(host, references):
         window[:, tokens:].copy_(patchify(reference))
     shared = shared_latents(window_hop)
-    chain = _FusedChain(host, tokens, tokens_per_frame, shared)
+    chain = _FusedChain(host, tokens, tokens_per_frame, shared, independent=independent)
     for index, seed in enumerate(seeds):
         generator = torch.Generator(device=device).manual_seed(int(seed))
         noise = torch.randn(1, 2 * tokens, host[0].shape[-1], device=device, dtype=torch.bfloat16, generator=generator)

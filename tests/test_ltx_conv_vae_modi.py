@@ -111,3 +111,36 @@ def test_decode_latent_runs_the_conv_decoder_whole() -> None:
 
     assert video.dtype == latent.dtype
     assert torch.equal(video, expected)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_conv_decoder_compile_is_opt_in(monkeypatch, enabled):
+    decoder = ConvVideoDecoder(**loader.conv_decoder_kwargs(CONV_VAE_CONFIG))
+    calls = []
+    def compile_forward(fn, **kwargs):
+        calls.append(kwargs)
+        return fn
+    monkeypatch.setenv("JASNA_LTX_COMPILE_CONV_DECODER", "1" if enabled else "0")
+    monkeypatch.setattr(loader, "_build", lambda *a: decoder)
+    monkeypatch.setattr(loader, "half_dtype", lambda device: torch.float16)
+    monkeypatch.setattr(loader, "compile_static", compile_forward)
+    assert loader._load_conv_video_decoder(CONV_VAE_CONFIG, {}, torch.device("cuda")) is decoder
+    assert len(calls) == int(enabled)
+    if enabled:
+        assert calls[0]["dtype"] == torch.float16
+        assert calls[0]["mode"] == "default"
+
+
+def test_decode_latent_dispatches_to_unbound_compiled_forward():
+    decoder = ConvVideoDecoder(**loader.conv_decoder_kwargs(CONV_VAE_CONFIG)).eval()
+    calls = []
+    def compiled(model, sample):
+        calls.append(model is decoder)
+        return ConvVideoDecoder.forward(model, sample)
+    decoder._compiled_forward = compiled
+    latent = torch.randn(1, 8, 2, 2, 2)
+    with torch.no_grad():
+        actual = loader.decode_latent(decoder, latent, 0, None)
+        expected = decoder(latent)
+    assert calls == [True]
+    assert torch.equal(actual, expected)

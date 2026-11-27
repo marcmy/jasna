@@ -69,9 +69,7 @@ class RestorationSession:
             config.fp16,
         )
         if key != self._detection_key:
-            if self._detection_model is not None:
-                self._detection_model.close()
-                self._detection_model, self._detection_key = None, None
+            self.release_detection_model()
             self._detection_model = build_compiled_detection_model(
                 config.detection_model_name,
                 config.detection_model_path,
@@ -84,10 +82,14 @@ class RestorationSession:
             self._detection_key = key
         return self._detection_model
 
+    def release_detection_model(self) -> None:
+        """Release the cached detector; the next request reloads it even with the same settings."""
+        model, self._detection_model, self._detection_key = self._detection_model, None, None
+        if model is not None:
+            model.close()
+
     def close(self) -> None:
-        if self._detection_model is not None:
-            self._detection_model.close()
-            self._detection_model = None
+        self.release_detection_model()
         if self.ltx_super_res is not None:
             self.ltx_super_res.close()
             self.ltx_super_res = None

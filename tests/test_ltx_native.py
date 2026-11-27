@@ -660,3 +660,16 @@ def test_amd_extension_builds_host_sources_only_so_nothing_is_hipified(monkeypat
     built = native._build_extension(tmp_path / "build")
     assert built["sources"] and all(Path(source).suffix == ".cpp" and Path(source).is_file() for source in built["sources"])
     assert built["extra_ldflags"][-2:] == [str(path) for path in objects]
+
+
+@pytest.mark.parametrize("architecture", [(7, 5), (8, 6), (8, 9), (12, 0), "gfx1201"])
+def test_wide_rotate_warp_policy(architecture):
+    dims = aot.BlockDims(4096, 16384, 32)
+    variants = aot.variants(architecture, dims, fp4=False)
+    for variant in variants:
+        if variant.family != "rotate_quantize":
+            continue
+        flags = dict(variant.constexprs)
+        expected = 16 if architecture == (7, 5) and flags["K"] == 16384 and not flags["MODULATE"] else 8
+        assert variant.num_warps == expected
+        assert kernel_policy.rotate_quantize_warps(architecture, flags["K"], modulate=flags["MODULATE"]) == expected

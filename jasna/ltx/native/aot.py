@@ -46,12 +46,12 @@ class Variant:
         return self.family + "".join(f"|{name}={int(value)}" for name, value in self.constexprs)
 
 
-def _rotate_quantize(k: int, modulate: bool) -> Variant:
+def _rotate_quantize(k: int, modulate: bool, architecture: tuple[int, int] | str) -> Variant:
     return Variant(
         "rotate_quantize", kernels._rotate_quantize_kernel,
         ("*bf16", "*bf16", "*bf16", "*i8", "*fp32", "i32", "i32"),
         ("x_ptr", "shift_ptr", "scale_ptr", "q_ptr", "s_ptr", "stride_x"),
-        (("K", k), ("MODULATE", modulate)), policy.ROTATE_QUANTIZE_WARPS, 3, (),
+        (("K", k), ("MODULATE", modulate)), policy.rotate_quantize_warps(architecture, k, modulate=modulate), 3, (),
     )
 
 
@@ -130,7 +130,8 @@ def variants(architecture: tuple[int, int] | str, dims: BlockDims, *, fp4: bool)
         return [_quantize_fp4(False), _quantize_fp4(True), _quantize_fp4_gated(dims.dim, dims.dim // dims.heads)]
     # the attention outputs quantize gated straight from their heads: on AMD as transformer._gated_heads
     # does, on NVIDIA with the sigmoid of the native block's gate_heads
-    found = [_rotate_quantize(dims.dim, True), _rotate_quantize(dims.dim, False), _rotate_quantize(dims.ff_dim, False),
+    found = [_rotate_quantize(dims.dim, True, architecture), _rotate_quantize(dims.dim, False, architecture),
+             _rotate_quantize(dims.ff_dim, False, architecture),
              _gated_rotate_quantize(dims.dim, dims.dim // dims.heads, exact_sigmoid=not is_amd(architecture))]
     projections = (  # (n, k, gelu, residual)
         (dims.dim, dims.dim, False, False),  # Q/K/V, cross-attention Q

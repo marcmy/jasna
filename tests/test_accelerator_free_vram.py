@@ -198,3 +198,20 @@ def test_used_vram_is_what_the_whole_gpu_does_not_have_free(monkeypatch):
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (30 * GIB, 32 * GIB))
     monkeypatch.setattr(accelerator, "_nvml_free_bytes", lambda device: 12 * GIB)
     assert accelerator.device_used_bytes(torch.device("cuda:0")) == 20 * GIB
+
+
+def test_ltx_activation_reserve_override(monkeypatch):
+    from jasna.ltx import sampler
+
+    monkeypatch.delenv("JASNA_LTX_ACTIVATION_RESERVE_MIB", raising=False)
+    assert sampler.activation_reserve_bytes() == 3 * GIB
+    monkeypatch.setenv("JASNA_LTX_ACTIVATION_RESERVE_MIB", "2816")
+    reserve = sampler.activation_reserve_bytes()
+    assert reserve == 2816 << 20
+    sizes = [256 << 20] * 48
+    free = 5120 << 20
+    assert sampler.resident_block_count(sizes, lambda limit: min(limit, free), activation_reserve=reserve) == 7
+    assert sampler.resident_block_count(sizes, lambda limit: min(limit, free)) == 6
+    monkeypatch.setenv("JASNA_LTX_ACTIVATION_RESERVE_MIB", "1024")
+    with pytest.raises(ValueError, match="between 2560 and 3072"):
+        sampler.activation_reserve_bytes()

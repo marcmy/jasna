@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import os
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TypeVar
@@ -26,7 +27,7 @@ from jasna.models.ltx_vae.video_encoder import (
     compile_video_encoder,
     encoder_head,
 )
-from jasna.tensor_utils import half_dtype
+from jasna.tensor_utils import compile_static, half_dtype
 
 _VAE_CLASS_NAME = "CausalDiffusionVAE"
 _CONV_VAE_CLASS_NAME = "CausalVideoAutoencoder"
@@ -253,13 +254,23 @@ def conv_decoder_kwargs(config: dict) -> dict:
 
 
 def _load_conv_video_decoder(config: dict, checkpoint: dict[str, torch.Tensor], device: torch.device) -> ConvVideoDecoder:
-    """Eval ``ConvVideoDecoder`` in bf16 (fp32 before SM 8.0: its activations are not checked against
-    fp16's range). It runs eagerly and takes no fine-tuned overlay."""
+    """Eval the convolutional VAE in half_dtype, without a fine-tuned overlay.
+
+    On Turing the fp16 decode is checked for finite output; compilation is opt-in.
+    """
     kwargs = conv_decoder_kwargs(config)
     state = {key.removeprefix("decoder."): value for key, value in checkpoint.items()}
     dtype = half_dtype(device)
     decoder = _build(lambda: ConvVideoDecoder(**kwargs), state, device, dtype)
-    return decoder.to(memory_format=torch.channels_last_3d)
+    decoder.to(memory_format=torch.channels_last_3d)
+    if device.type == "cuda" and os.environ.get("JASNA_LTX_COMPILE_CONV_DECODER") == "1":
+        # Compile the unbound method so the decoder does not retain itself through
+        # a bound-method closure after the compose pass unloads the model.
+        eager = ConvVideoDecoder.forward
+        compiled = compile_static(eager, mode="default", device=device, dtype=dtype)
+        decoder._compiled_forward = compiled if compiled is not eager else None
+        logger.info("LTX conv VAE decoder: %s", "compiled" if compiled is not eager else "eager (compile unavailable)")
+    return decoder
 
 
 def _diffusion_block_count(tensors: Iterable[str]) -> int:
@@ -331,7 +342,8 @@ def decode_latent(
     if isinstance(decoder, ConvVideoDecoder):
         weight = decoder.conv_in.conv.weight
         sample = latent.to(dtype=weight.dtype, memory_format=torch.channels_last_3d)
-        video = decoder(sample)
+        compiled = getattr(decoder, '_compiled_forward', None)
+        video = decoder(sample) if compiled is None else compiled(decoder, sample)
         if not torch.isfinite(video).all().item():
             raise RuntimeError('Conv VAE produced non-finite values')
         return video.to(latent.dtype)

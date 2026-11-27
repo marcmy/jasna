@@ -181,6 +181,22 @@ def test_session_reuses_its_detector_until_detection_settings_change() -> None:
     changed.close.assert_called_once_with()
 
 
+def test_session_reloads_released_detector_with_same_settings() -> None:
+    session = RestorationSession(device=MagicMock(), restoration_pipeline=None, log_callback=None)
+    config = session_config()
+    with patch("jasna.session_factory.build_compiled_detection_model") as build:
+        build.side_effect = lambda *args, **kwargs: MagicMock()
+        first = session.detection_model_for(config)
+        session.release_detection_model()
+        session.release_detection_model()
+        second = session.detection_model_for(config)
+        assert first is not second
+        assert build.call_count == 2
+        first.close.assert_called_once_with()
+        session.close()
+        second.close.assert_called_once_with()
+
+
 def test_build_pipeline_loads_a_segment_model_the_session_lacks() -> None:
     import torch
 

@@ -288,3 +288,20 @@ def test_kernels_reject_widths_they_would_compute_wrong(kernels):
     if kernel_policy.gpu_architecture(codes.device) not in kernel_policy.CUBLAS_INT8_MM:  # cuBLAS takes any width divisible by 8
         with pytest.raises(ValueError):
             kernels.int8_scaled_mm(codes, torch.ones(8, device="cuda"), weights, torch.ones(256, device="cuda"), None, False)
+
+
+@pytest.mark.parametrize("rows", [64, 4096])
+def test_turing_wide_rotate_matches_original_warp_count(kernels, rows):
+    if torch.cuda.get_device_capability() != (7, 5):
+        pytest.skip("Turing-specific launch")
+    torch.manual_seed(42)
+    x = torch.randn(rows, 16384, dtype=torch.bfloat16, device="cuda")
+    old_codes = torch.empty_like(x, dtype=torch.int8)
+    old_scales = torch.empty(rows, dtype=torch.float32, device="cuda")
+    kernels._rotate_quantize_kernel[(rows,)](
+        x, x, x, old_codes, old_scales, x.stride(0), rows // 2,
+        K=16384, MODULATE=False, num_warps=8,
+    )
+    codes, scales = kernels.rotate_quantize(x)
+    assert torch.equal(codes, old_codes)
+    assert torch.equal(scales, old_scales)

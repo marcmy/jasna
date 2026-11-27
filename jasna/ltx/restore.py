@@ -17,6 +17,7 @@ that directory to resume; previews and speed tests use temporary directories.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -160,6 +161,7 @@ class LtxRender:
     super_res: LtxSuperRes | None
     vr_projector: RegionProjector | None
     frame_numbers: FrameNumbers
+    on_scan_complete: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +196,8 @@ def prepare_spans(
         starting.shutdown(wait=False)
     try:
         prepared = _scan_spans(spans, render, directory, progress=progress, cancel=cancel, worker_ready=worker_ready)
+        if render.on_scan_complete is not None:
+            render.on_scan_complete()
     except BaseException:
         _settle(worker_ready)
         raise
@@ -335,18 +339,47 @@ def denoise_spans(
         bar.reuse(sum(reused.values()) * len(transformer.conditions), 0, reused)
         for p, span_finals in zip(prepared, finals):
             for segment, segment_plans, references, store in zip(p.span.segments, p.plans, p.references, span_finals):
-                for plan in segment_plans:
+                batch_tracks = (
+                    os.environ.get("JASNA_LTX_BATCH_INDEPENDENT") == "1"
+                    and not keep_references and isinstance(transformer, LtxTransformer)
+                )
+                pending = [plan for plan in segment_plans if keep_references or not store.has_track(plan)]
+                index = 0
+                while index < len(pending):
                     check_cancel(cancel)
-                    if not keep_references and store.has_track(plan):
-                        continue
+                    plan = pending[index]
+                    group = [plan]
+                    if batch_tracks and len(plan.windows) == 1 and index + 1 < len(pending):
+                        next_plan = pending[index + 1]
+                        if (len(next_plan.windows) == 1
+                                and next_plan.windows[0].canvas == plan.windows[0].canvas
+                                and next_plan.window_hop == plan.window_hop):
+                            group.append(next_plan)
                     advance = bar.track(plan.windows[0].canvas, len(transformer.conditions))
-                    latents = denoise_track(plan, transformer, references, seed=segment.seed, advance=advance)
-                    for window, latent in zip(plan.windows, latents):
-                        store.put(window.index, latent)
-                    if not keep_references:
-                        store.commit_track(plan)
-                        for window in plan.windows:
-                            references.delete(window.index)
+                    if len(group) == 1:
+                        results = [denoise_track(plan, transformer, references, seed=segment.seed, advance=advance)]
+                    else:
+                        windows_in_group = [member.windows[0] for member in group]
+                        inputs = [references.get(w.index) for w in windows_in_group]
+                        if inputs[0].shape == inputs[1].shape:
+                            def advance_group(n: int) -> None:
+                                check_cancel(cancel)
+                                advance(n)
+                            results = [[latent] for latent in transformer.denoise_chain(
+                                inputs, [segment.seed + w.noise for w in windows_in_group],
+                                plan.window_hop, advance_group, independent=True,
+                            )]
+                        else:
+                            results = [denoise_track(member, transformer, references, seed=segment.seed, advance=advance)
+                                       for member in group]
+                    for member, latents in zip(group, results, strict=True):
+                        for window, latent in zip(member.windows, latents, strict=True):
+                            store.put(window.index, latent)
+                        if not keep_references:
+                            store.commit_track(member)
+                            for window in member.windows:
+                                references.delete(window.index)
+                    index += len(group)
 
 
 def compose_spans(
@@ -439,7 +472,7 @@ def restore_spans(
         with scratch_folder(work_dir, ".ltx-") as temp:
             _restore_spans(
                 [speed_test],
-                replace(render, detector=_SpeedTestMosaics()),
+                replace(render, detector=_SpeedTestMosaics(), on_scan_complete=None),
                 temp,
                 progress=progress.speed_test(),
                 cancel=cancel,
@@ -516,6 +549,7 @@ def restore_video(
     vr_projector: RegionProjector | None,
     frame_numbers: FrameNumbers,
     runtime: ModelRuntime,
+    on_scan_complete: Callable[[], None] | None = None,
 ) -> None:
     """Restore every mosaic of the video ``frames`` yields as one segment. ``large_canvas``
     is ``whole_video_large_canvas``'s decision; the decode tiles follow the free VRAM."""
@@ -540,6 +574,7 @@ def restore_video(
             super_res=super_res,
             vr_projector=vr_projector,
             frame_numbers=frame_numbers,
+            on_scan_complete=on_scan_complete,
         ),
         work_dir=work_dir,
         progress=progress,

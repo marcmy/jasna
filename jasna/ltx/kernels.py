@@ -41,6 +41,7 @@ from jasna.ltx.kernel_policy import (
     gpu_architecture,
     has_tma,
     programs,
+    rotate_quantize_warps,
 )
 
 EPS = tl.constexpr(1e-6)
@@ -118,7 +119,7 @@ def _rotate_quantize(x, shift, scale, modulate):
     scales = torch.empty(m, dtype=torch.float32, device=x.device)
     _rotate_quantize_kernel[(m,)](
         x, shift, scale, codes, scales, x.stride(0), max(m // 2, 1), K=k, MODULATE=modulate,
-        num_warps=ROTATE_QUANTIZE_WARPS,
+        num_warps=rotate_quantize_warps(_cached_gpu_architecture(x.device), k, modulate=modulate),
     )
     return codes, scales
 

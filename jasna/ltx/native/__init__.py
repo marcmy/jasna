@@ -185,8 +185,8 @@ def _build_flags(cuda_home: Path) -> dict[str, list[str]]:
     """Compiler and linker flags to build the extension against the CUDA driver API, per platform."""
     if _IS_WINDOWS:
         return {
-            "extra_cflags": ["/O2"],
-            "extra_cuda_cflags": ["-O3"],
+            "extra_cflags": ["/O2", "/Zc:preprocessor"],
+            "extra_cuda_cflags": ["-O3", "-Xcompiler=/Zc:preprocessor"],
             "extra_ldflags": [str(cuda_home / "lib" / "x64" / "cuda.lib")],
         }
     return {

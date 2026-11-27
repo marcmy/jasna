@@ -13,6 +13,15 @@ import torch
 from jasna.accelerator import TRITON_HIP_ARCHITECTURES, amd_gpu_architecture, is_amd_device
 
 ROTATE_QUANTIZE_WARPS = 8
+
+
+def rotate_quantize_warps(architecture: tuple[int, int] | str, width: int, *, modulate: bool) -> int:
+    # RTX 2070 SUPER: wide FF-down quantizer was 31% faster with identical codes and scales.
+    # Keep modulation unchanged: changing warp count changes its floating-point reduction.
+    if architecture == (7, 5) and width == 16384 and not modulate:
+        return 16
+    return ROTATE_QUANTIZE_WARPS
+
 GROUP_M = 8
 # Outputs narrower than SMALL_MM_MAX_N (the per-head gate logits) take SMALL_MM_TILE; inputs
 # wider than WIDE_K (the FF down projection) take the second tile of INT8_MM_TILES.

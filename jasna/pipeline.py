@@ -204,6 +204,7 @@ class Pipeline:
         self.input_video = input_video
         self.output_video = output_video
         self.device = session.device
+        self._session = session
         self.detection_model = session.detection_model_for(config)
         self.restoration_pipeline = session.restoration_pipeline
         self.ltx_files = session.ltx_files
@@ -467,6 +468,19 @@ class Pipeline:
             or frame_upscale_size(self.config, int(metadata.video_width), int(metadata.video_height)) is not None
         )
 
+    def _release_ltx_detector(self) -> None:
+        """Free the whole-video detector once its final scan has completed."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            before = device_free_bytes(self.device)
+        self._session.release_detection_model()
+        self.detection_model = self.job_detection_model = None
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+            after = device_free_bytes(self.device)
+            log.info("LTX detector released: %d MiB free before, %d MiB after (%+d MiB)",
+                     before >> 20, after >> 20, (after - before) >> 20)
+
     def _run_ltx(self, metadata) -> None:
         from jasna.ltx.tracks import track_max_gap
         from jasna.ltx.inference import Cancelled
@@ -514,6 +528,7 @@ class Pipeline:
                 vr_projector=self.vr_projector,
                 frame_numbers=FrameNumbers.of_video(metadata),
                 runtime=self._ltx_runtime,
+                on_scan_complete=self._release_ltx_detector,
             )
         except Cancelled:
             log.info("LTX restoration cancelled")
